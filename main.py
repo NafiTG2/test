@@ -1022,10 +1022,84 @@ async def send_video(u, c):     await send_media(u, c, "video")
 async def send_animation(u, c): await send_media(u, c, "animation")
 async def send_sticker(u, c):   await send_media(u, c, "sticker")
 
+# ================= AES-256-GCM ENCRYPTION HELPERS =================
+# Binary layout of encrypted file:
+#   [4 bytes: magic "BVKP"] [32 bytes: PBKDF2 salt] [12 bytes: GCM nonce] [N bytes: ciphertext+tag]
+# Key derivation: PBKDF2-HMAC-SHA256, 600_000 iterations, 32-byte key
+# No external dependencies — uses Python stdlib only (hashlib + hmac).
+
+import struct
+import hmac as _hmac
+
+_MAGIC        = b"BVKP"          # BlockVeil Encrypted Payload
+_SALT_LEN     = 32
+_NONCE_LEN    = 12
+_TAG_LEN      = 16
+_PBKDF2_ITER  = 600_000
+
+def _derive_key(password: str, salt: bytes) -> bytes:
+    """PBKDF2-HMAC-SHA256 → 32-byte AES key."""
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt, _PBKDF2_ITER, dklen=32)
+
+def _aes_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
+    """
+    AES-256-GCM encryption using cryptography library.
+    Returns ciphertext + 16-byte authentication tag (appended).
+    """
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    aesgcm = AESGCM(key)
+    return aesgcm.encrypt(nonce, plaintext, None)   # returns ciphertext || tag
+
+def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext_and_tag: bytes) -> bytes:
+    """AES-256-GCM decryption. Raises InvalidTag if key/data is wrong."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    aesgcm = AESGCM(key)
+    return aesgcm.decrypt(nonce, ciphertext_and_tag, None)
+
+def encrypt_backup(plaintext: bytes, password: str) -> bytes:
+    """
+    Encrypt plaintext bytes with AES-256-GCM.
+    Returns binary blob: magic + salt + nonce + ciphertext+tag
+    """
+    salt      = secrets.token_bytes(_SALT_LEN)
+    nonce     = secrets.token_bytes(_NONCE_LEN)
+    key       = _derive_key(password, salt)
+    ct_tag    = _aes_gcm_encrypt(key, nonce, plaintext)
+    return _MAGIC + salt + nonce + ct_tag
+
+def decrypt_backup(blob: bytes, password: str) -> bytes:
+    """
+    Decrypt blob produced by encrypt_backup.
+    Raises ValueError on wrong magic or wrong password (authentication failure).
+    """
+    if not blob.startswith(_MAGIC):
+        raise ValueError("Not a valid BlockVeil encrypted backup.")
+    offset    = len(_MAGIC)
+    salt      = blob[offset : offset + _SALT_LEN];   offset += _SALT_LEN
+    nonce     = blob[offset : offset + _NONCE_LEN];  offset += _NONCE_LEN
+    ct_tag    = blob[offset:]
+    key       = _derive_key(password, salt)
+    try:
+        return _aes_gcm_decrypt(key, nonce, ct_tag)
+    except Exception:
+        raise ValueError("Decryption failed. Wrong password or corrupted file.")
+
 # ================= /exportall =================
 async def export_all(update: Update, context):
     if update.effective_chat.id != GROUP_ID:
         return
+
+    # Usage: /exportall <password>
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /exportall <password>\n\n"
+            "Example: /exportall MySecret123\n\n"
+            "⚠️ Keep your password safe. Without it the backup cannot be decrypted.",
+            parse_mode="HTML"
+        )
+        return
+
+    password = context.args[0]
 
     with get_conn() as conn:
         users   = [dict(r) for r in conn.execute("SELECT * FROM users").fetchall()]
@@ -1033,62 +1107,103 @@ async def export_all(update: Update, context):
         msgs    = [dict(r) for r in conn.execute("SELECT * FROM messages").fetchall()]
         gmmap   = [dict(r) for r in conn.execute("SELECT * FROM group_message_map").fetchall()]
 
-    payload = {
-        "exported_at": get_bst_now(),
+    payload_dict = {
+        "exported_at":       get_bst_now(),
         "users":             users,
         "tickets":           tickets,
         "messages":          msgs,
         "group_message_map": gmmap,
     }
 
-    buf      = BytesIO(json.dumps(payload, ensure_ascii=False, indent=2).encode())
-    buf.name = f"blockveil_backup_{get_bst_now().replace(' ', '_').replace(':', '-')}.json"
+    plaintext = json.dumps(payload_dict, ensure_ascii=False).encode()
+
+    try:
+        encrypted = encrypt_backup(plaintext, password)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Encryption failed: {e}", parse_mode="HTML")
+        return
+
+    ts       = get_bst_now().replace(" ", "_").replace(":", "-")
+    buf      = BytesIO(encrypted)
+    buf.name = f"blockveil_backup_{ts}.bvenc"
 
     await context.bot.send_document(
         chat_id=GROUP_ID,
         document=buf,
         caption=(
-            f"🗄 <b>Full Database Export</b>\n\n"
+            f"🔐 <b>Encrypted Database Export</b>\n\n"
             f"👥 Users    : {len(users)}\n"
             f"🎫 Tickets  : {len(tickets)}\n"
             f"💬 Messages : {len(msgs)}\n"
             f"🗺 Msg Map  : {len(gmmap)}\n\n"
-            f"📅 Exported : {get_bst_now()} BST\n\n"
-            f"To restore, reply to this file with /importall"
+            f"📅 Exported : {get_bst_now()} BST\n"
+            f"🔒 Encrypted: AES-256-GCM + PBKDF2\n\n"
+            f"To restore, reply to this file with:\n"
+            f"/importall &lt;password&gt;"
         ),
         parse_mode="HTML"
     )
+
+    # Delete the command message so password is not visible in chat
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
 
 # ================= /importall =================
 async def import_all(update: Update, context):
     if update.effective_chat.id != GROUP_ID:
         return
 
-    # Must reply to a document
     if not update.message.reply_to_message or not update.message.reply_to_message.document:
         await update.message.reply_text(
-            "❌ Reply to the exported .json file with /importall",
+            "❌ Reply to the encrypted .bvenc backup file with:\n/importall &lt;password&gt;",
             parse_mode="HTML"
         )
         return
 
-    doc = update.message.reply_to_message.document
-    if not doc.file_name.endswith(".json"):
+    if not context.args:
         await update.message.reply_text(
-            "❌ File must be a .json export from /exportall",
+            "❌ Password required.\nUsage: /importall &lt;password&gt;",
             parse_mode="HTML"
         )
         return
 
-    # Download and parse
+    password = context.args[0]
+    doc      = update.message.reply_to_message.document
+
+    if not doc.file_name.endswith(".bvenc"):
+        await update.message.reply_text(
+            "❌ File must be a .bvenc export from /exportall",
+            parse_mode="HTML"
+        )
+        return
+
+    # Delete the command message so password is not visible in chat
     try:
-        file     = await context.bot.get_file(doc.file_id)
-        buf      = BytesIO()
+        await update.message.delete()
+    except Exception:
+        pass
+
+    # Download
+    try:
+        file = await context.bot.get_file(doc.file_id)
+        buf  = BytesIO()
         await file.download_to_memory(buf)
-        buf.seek(0)
-        payload  = json.loads(buf.read().decode())
+        blob = buf.getvalue()
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to read file: {e}", parse_mode="HTML")
+        await update.message.reply_text(f"❌ Failed to download file: {e}", parse_mode="HTML")
+        return
+
+    # Decrypt
+    try:
+        plaintext = decrypt_backup(blob, password)
+        payload   = json.loads(plaintext.decode())
+    except ValueError as e:
+        await update.message.reply_text(f"❌ {e}", parse_mode="HTML")
+        return
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to process file: {e}", parse_mode="HTML")
         return
 
     # Validate structure
@@ -1105,7 +1220,6 @@ async def import_all(update: Update, context):
     try:
         with _db_lock, get_conn() as conn:
 
-            # ---- users ----
             for u in payload["users"]:
                 try:
                     conn.execute("""
@@ -1119,7 +1233,6 @@ async def import_all(update: Update, context):
                 except Exception:
                     users_s += 1
 
-            # ---- tickets ----
             for t in payload["tickets"]:
                 try:
                     conn.execute("""
@@ -1127,16 +1240,13 @@ async def import_all(update: Update, context):
                             (ticket_id, user_id, username, status, created_at)
                         VALUES(:ticket_id, :user_id, :username, :status, :created_at)
                     """, t)
-                    if conn.execute(
-                        "SELECT changes()"
-                    ).fetchone()[0] == 0:
+                    if conn.execute("SELECT changes()").fetchone()[0] == 0:
                         tickets_s += 1
                     else:
                         tickets_i += 1
                 except Exception:
                     tickets_s += 1
 
-            # ---- messages (use original id to avoid duplicates) ----
             for m in payload["messages"]:
                 try:
                     conn.execute("""
@@ -1151,7 +1261,6 @@ async def import_all(update: Update, context):
                 except Exception:
                     msgs_s += 1
 
-            # ---- group_message_map ----
             for g in payload["group_message_map"]:
                 try:
                     conn.execute("""
